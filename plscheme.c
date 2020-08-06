@@ -1,7 +1,7 @@
 /*
  * PL/scheme, Procedural Language Handler
  *
- * Copyright (c) 2006-2019, Volkan Yazıcı <vlkan.yazici@gmail.com>
+ * Copyright (c) 2006-2020, Volkan Yazıcı <vlkan.yazici@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,6 +32,8 @@
 #include "lib/stringinfo.h"
 #include "commands/trigger.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/xact.h"
 #include "utils/syscache.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -39,7 +41,9 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/array.h"
+#include "utils/guc.h"
 #include "utils/fmgroids.h"
+#include "utils/rel.h"
 #include "utils/memutils.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
@@ -51,6 +55,7 @@
 
 PG_MODULE_MAGIC;
 
+extern void _PG_init(void);
 
 /*
  * Storage types for procedure meta information.
@@ -137,9 +142,9 @@ typedef struct
 	bool	resisnull;
 	Datum	res;
 	
-	/* Transaction and command IDs. (To check validity of a cached result.) */
+	/* Transaction and TID. (To check validity of a cached result.) */
 	TransactionId	xmin;
-	CommandId		cmin;
+	ItemPointerData tid;
 } proc_t;
 
 /* Storage type for hash_t. */
@@ -290,7 +295,10 @@ typedef struct
 } exception_t;
 
 /* Exceptions table. */
-static exception_t	excptbl[179];
+#define DEFINE_EXCP(a, b)
+#include "exceptions.h"
+static exception_t	excptbl[NUM_EXCEPTIONS];
+#undef DEFINE_EXCP
 
 /*
  * PostgreSQL exception catching macros to use with SPI function calls. In case
@@ -387,8 +395,8 @@ static exception_t	excptbl[179];
 static char *module_dir = MODULE_DIR;
 
 /* Initialization and data conversion files' names. */
-#define FILE_INIT		"init.scm"
-#define FILE_DATACONV	"dataconv.scm"
+#define FILE_INIT		"plschemeu-init.scm"
+#define FILE_DATACONV	"plschemeu-dataconv.scm"
 
 /* Generic function to concatenate module_dir and file names. */
 #define BUILD_FILE_PATH(buf, file) \
@@ -470,7 +478,7 @@ static bool spi_conn_established = false;
 
 #define ESTABLISH_SPI_CONN() \
 	if (SPI_connect() != SPI_OK_CONNECT) \
-		elog(ERROR, "Could not connect to SPI manager!"); \
+		elog(ERROR, "could not connect to SPI manager"); \
 	else \
 		spi_conn_established = true;
 
@@ -646,13 +654,15 @@ _PG_init(void)
 	DefineCustomStringVariable("plscheme" UNTRUSTED_PL_INDICATOR ".module_dir",
 							   "Module directory for initialization and data "
 							   "conversion scripts.",
-							   NULL, &module_dir, PGC_BACKEND, NULL, NULL);
+							   NULL,
+							   &module_dir, MODULE_DIR, PGC_BACKEND, 0, NULL, NULL, NULL);
 	
 	DefineCustomIntVariable("plscheme" UNTRUSTED_PL_INDICATOR ".cache_max_size",
 							"Maximum number of (non-volatile and non-SRF) "
 							"procedures to cache.",
-							NULL, &cache_max_size, 0, 1024, PGC_BACKEND,
-							NULL, NULL);
+							NULL,
+							&cache_max_size, CACHE_MAX_SIZE, 0, 1024, PGC_BACKEND,
+							0, NULL, NULL, NULL);
 }
 
 
@@ -673,7 +683,7 @@ init_proc_tuple(FunctionCallInfo fcinfo, HeapTuple *in_proctup,
 							 ObjectIdGetDatum(fcinfo->flinfo->fn_oid),
 							 0, 0, 0);
 	if (!HeapTupleIsValid(proctup))
-		elog(ERROR, "Cache lookup failed for the procedure! "
+		elog(ERROR, "cache lookup failed for the procedure "
 					"(OID: %u)", fcinfo->flinfo->fn_oid);
 	procstruct = (Form_pg_proc) GETSTRUCT(proctup);
 
@@ -685,7 +695,7 @@ init_proc_tuple(FunctionCallInfo fcinfo, HeapTuple *in_proctup,
 
 	/* Transaction and command IDs. */
 	proc->xmin = HeapTupleHeaderGetXmin(proctup->t_data);
-	proc->cmin = HeapTupleHeaderGetCmin(proctup->t_data);
+	proc->tid = proctup->t_self;
 
 	/*
 	 * Procedure source code.
@@ -693,7 +703,7 @@ init_proc_tuple(FunctionCallInfo fcinfo, HeapTuple *in_proctup,
 	procsrc = SysCacheGetAttr(PROCOID, proctup,
 							  Anum_pg_proc_prosrc, &isnull);
 	if (isnull)
-		elog(ERROR, "Null prosrc!");
+		elog(ERROR, "null prosrc");
 	proc->src = DatumGetCString(DirectFunctionCall1(textout, procsrc));
 
 	*in_proctup = proctup;
@@ -728,7 +738,7 @@ plscheme_func_handler(FunctionCallInfo fcinfo)
 							 ObjectIdGetDatum(procstruct->prorettype),
 							 0, 0, 0);
 	if (!HeapTupleIsValid(typetup))
-		elog(ERROR, "Cache lookup failed for type %u.",
+		elog(ERROR, "cache lookup failed for type %u",
 			 procstruct->prorettype);
 	typestruct = (Form_pg_type) GETSTRUCT(typetup);
 	proc->resisrow = (typestruct->typtype == 'c' ||
@@ -973,7 +983,7 @@ cache_lookup(void)
 		 * pg_proc entry without changing its OID.
 		 */
 		if (node->proc->xmin == proc->xmin &&
-			node->proc->cmin == proc->cmin)
+			ItemPointerEquals(&node->proc->tid, &proc->tid))
 		{
 			cache_load(node->proc);
 			node->ncalls++;
@@ -1202,7 +1212,6 @@ cache_register_meta(void)
 {
 	cache_node_t	*n;
 	proc_t			*p;
-	char			 s[128];
 
 	/* Make available room for addition. */
 	cache_unregister_deprecated();
@@ -1219,17 +1228,13 @@ cache_register_meta(void)
 	/* Compute hash value of the current proc_t. */
 	n->hash = hash_proc_t(proc);
 
-	/* We'll need a fancy memory context name. */
-	snprintf(s, 128, "plscheme-cached-proc-%d", proc->id);
-
 	/*
 	 * Create a new memory context for the to be cached procedure. This allows
 	 * us to reclaim the function's storage cleanly.
 	 */
-	n->mcxt = AllocSetContextCreate(TopTransactionContext, s,
-									ALLOCSET_DEFAULT_MINSIZE,
-									ALLOCSET_DEFAULT_INITSIZE,
-									ALLOCSET_DEFAULT_MAXSIZE);
+	n->mcxt = AllocSetContextCreate(TopTransactionContext,
+									"plscheme-cached-proc",
+									ALLOCSET_SMALL_SIZES);
 
 	/* Switch to procedure's memory context. */
 	MemoryContextSwitchTo(n->mcxt);
@@ -1239,7 +1244,7 @@ cache_register_meta(void)
 	/*
 	 * List of proc_t members will be needed to load procedure from the cache:
 	 * 
-	 *   Common members         : id, istrigger, resisnull, res, xmin, cmin.
+	 *   Common members         : id, istrigger, resisnull, res, xmin, tid.
 	 *   For a basic procedure  : nargs, args.
 	 *   For a trigger procedure: tg_when, tg_event, tg_for, tg_newtup_natts,
 	 *   						  tg_oldtup_natts, tg_newtup, tg_oldtup,
@@ -1249,7 +1254,7 @@ cache_register_meta(void)
 	p->id = proc->id;
 	p->istrigger = proc->istrigger;
 	p->xmin = proc->xmin;
-	p->cmin = proc->cmin;
+	p->tid = proc->tid;
 	
 	/*
 	 * resisnull and res attributes will be handled later by
@@ -1365,7 +1370,7 @@ static void
 cache_unregister(cache_node_t *node)
 {
 	cache_node_t	*p;
-	bool			 found = false;
+	bool			 found PG_USED_FOR_ASSERTS_ONLY = false;
 
 	/* Neither cache_node, nor node can be null in this situation. */
 	Assert(cache_nodes && node);
@@ -1427,7 +1432,7 @@ build_arg_t(int nargs, Oid *types, char **names, char *modes,
 		
 		typetup = SearchSysCache(TYPEOID, ObjectIdGetDatum(types[i]), 0, 0, 0);
 		if (!HeapTupleIsValid(typetup))
-			elog(ERROR, "Cache lookup failed for type %u.", types[i]);
+			elog(ERROR, "cache lookup failed for type %u", types[i]);
 		typestruct = (Form_pg_type) GETSTRUCT(typetup);
 		ispseudorecord = (typestruct->typtype == 'p' &&
 						  types[i] == RECORDOID);
@@ -1486,7 +1491,7 @@ build_arg_t(int nargs, Oid *types, char **names, char *modes,
 
 			/* Calculate will be required room count. */
 			for (j = sub_nargs = 0; j < tupdesc->natts; j++)
-				if (!tupdesc->attrs[j]->attisdropped || ispseudorecord)
+				if (!TupleDescAttr(tupdesc, j)->attisdropped || ispseudorecord)
 					sub_nargs++;
 
 			sub_types = palloc(sub_nargs * sizeof(Oid));
@@ -1499,12 +1504,12 @@ build_arg_t(int nargs, Oid *types, char **names, char *modes,
 				 * Record row types are logically invisible, therefore their
 				 * attisdropped attribute is always true.
 				 */
-				if (!tupdesc->attrs[j]->attisdropped || ispseudorecord)
+				if (!TupleDescAttr(tupdesc, j)->attisdropped || ispseudorecord)
 				{
 					sub_values[k] = heap_getattr(&tupdata, (j + 1), tupdesc,
 												 &sub_nulls[k]);
-					sub_types[k] = tupdesc->attrs[j]->atttypid;
-					sub_names[k] = NameStr(tupdesc->attrs[j]->attname);
+					sub_types[k] = TupleDescAttr(tupdesc, j)->atttypid;
+					sub_names[k] = NameStr(TupleDescAttr(tupdesc, j)->attname);
 
 					k++;
 				}
@@ -1523,7 +1528,7 @@ build_arg_t(int nargs, Oid *types, char **names, char *modes,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("PL/scheme functions cannot handle %s type.",
+					 errmsg("PL/scheme functions do not support type \"%s\"",
 						    NameStr(typestruct->typname))));
 
 EndOfLoop:
@@ -1550,7 +1555,7 @@ arg_t_from_tuple(HeapTuple tup, TupleDesc tupdesc, int *in_nargs)
 
 	/* Calculate available attributes. */
 	for (i = nargs = 0; i < tupdesc->natts; i++)
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 			nargs++;
 
 	types = palloc(nargs * sizeof(Oid));
@@ -1559,11 +1564,11 @@ arg_t_from_tuple(HeapTuple tup, TupleDesc tupdesc, int *in_nargs)
 	values = palloc(nargs * sizeof(Datum));
 
 	for (i = j = 0; i < tupdesc->natts; i++)
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 		{
 			values[j] = heap_getattr(tup, (i + 1), tupdesc, &nulls[j]);
-			names[j] = NameStr(tupdesc->attrs[i]->attname);
-			types[j] = tupdesc->attrs[i]->atttypid;
+			names[j] = NameStr(TupleDescAttr(tupdesc, i)->attname);
+			types[j] = TupleDescAttr(tupdesc, i)->atttypid;
 
 			++j;
 		}
@@ -1593,8 +1598,7 @@ parse_func_args(FunctionCallInfo fcinfo, HeapTuple proctup,
 	if (proc->nargs > 0 && !names)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("You must supply argument aliases in "
-					 	"PL/scheme procedures.")));
+				 errmsg("argument aliases are required in PL/scheme procedures")));
 
 	/* Disallow duplicate usage of the same name. */
 	for (i = 0; i < proc->nargs; i++)
@@ -1602,8 +1606,7 @@ parse_func_args(FunctionCallInfo fcinfo, HeapTuple proctup,
 			if (!strcmp(names[i], names[j]))
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("Found duplicated argument aliases at "
-							 	"positions %d and %d.", i, j)));
+						 errmsg("duplicate argument aliases at positions %d and %d", i, j)));
 
 	/* Build arg_t array. */
 	proc->args = build_arg_t(proc->nargs, types, names, modes,
@@ -1636,7 +1639,7 @@ parse_trig_args(FunctionCallInfo fcinfo)
 	else if (TRIGGER_FIRED_AFTER(tgdata->tg_event))
 		proc->tg_when = TG_AFTER;
 	else
-		elog(ERROR, "Unrecognized trigger event!");
+		elog(ERROR, "unrecognized trigger event");
 
 	/* Trigged for what? */
 	if (TRIGGER_FIRED_FOR_ROW(tgdata->tg_event))
@@ -1644,7 +1647,7 @@ parse_trig_args(FunctionCallInfo fcinfo)
 	else if (TRIGGER_FIRED_FOR_STATEMENT(tgdata->tg_event))
 		proc->tg_for = TG_FOR_STMT;
 	else
-		elog(ERROR, "Unrecognized trigger level!");
+		elog(ERROR, "unrecognized trigger level");
 
 	/* Trigged on what? */
 	if (TRIGGER_FIRED_BY_INSERT(tgdata->tg_event))
@@ -1673,7 +1676,7 @@ parse_trig_args(FunctionCallInfo fcinfo)
 		}
 	}
 	else
-		elog(ERROR, "Unrecognized trigger operation!");
+		elog(ERROR, "unrecognized trigger operation");
 
 	/* Arguments passed to function. */
 	proc->tg_nargs = tgdata->tg_trigger->tgnargs;
@@ -1873,8 +1876,7 @@ check_tuple_consistency(tuple_t *tuple, arg_t *args, int nargs)
 	if (tuple->natts != nargs)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("Required argument count (%d) is not "
-					 	"satisfied. (Found %d attributes.)",
+				 errmsg("required argument count (%d) is not satisfied: found %d attributes",
 						nargs, tuple->natts)));
 
 	/*
@@ -1932,8 +1934,7 @@ check_tuple_consistency(tuple_t *tuple, arg_t *args, int nargs)
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("Expecting an attribute with name `%s' "
-							 	"(instead of `%s') at position %d.",
+						 errmsg("expected an attribute with name \"%s\" instead of \"%s\" at position %d",
 								args[i].name, tuple->names[i], i)));
 		}
 		
@@ -1942,8 +1943,7 @@ check_tuple_consistency(tuple_t *tuple, arg_t *args, int nargs)
 			  args[i].mode == PROARGMODE_INOUT))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("Expecting mode `%c' (instead of `%c') "
-						 	"at position %d.",
+					 errmsg("expected mode \"%c\" instead of \"%c\" at position %d",
 							args[i].mode, tuple->modes[i], i)));
 
 		/* No need to bother with type checking if attribute value is NULL. */
@@ -1959,8 +1959,7 @@ check_tuple_consistency(tuple_t *tuple, arg_t *args, int nargs)
 		if (tuple->types[i] != args[i].type)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("Expecting an attribute with type `%s' "
-						 	"(instead of `%s') at position %d.",
+					 errmsg("expected an attribute with type \"%s\" instead of \"%s\" at position %d",
 							format_type_be(args[i].type),
 							format_type_be(tuple->types[i]), i)));
 
@@ -2038,8 +2037,7 @@ tuple_t_from_alist(SCM alist, char mode, bool inner, arg_t *args, int nargs)
 	if (!scm_is_list(alist))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("You must return an association list for a "
-					 	"record type.")));
+				 errmsg("expected assoc list to build a record")));
 
 	/* Calculate will be required room count. */
 	for (i = 0, cdr = alist; !scm_is_null(cdr); cdr = scm_cdr(cdr), i++)
@@ -2075,10 +2073,11 @@ tuple_t_from_alist(SCM alist, char mode, bool inner, arg_t *args, int nargs)
 		else if (scm_is_list(val))
 		{
 			HeapTuple	 tup;
-			TupleDesc	 tupdesc;
+			TupleDesc	 tupdesc = NULL;
 			tuple_t		*subtuple;
 
 			subtuple = tuple_t_from_alist(val, mode, true, args, nargs);
+			/* TODO! tupdesc needs a value */
 			tup = heap_from_tuple_t(subtuple, tupdesc);
 
 			tuple->values[i] = HeapTupleGetDatum(tup);
@@ -2118,13 +2117,13 @@ tuple_t_from_alist(SCM alist, char mode, bool inner, arg_t *args, int nargs)
 				HeapTuple		typetup;
 				Form_pg_type	typestruct;
 
-				parseTypeString(typename, &typid, &typmod);
+				parseTypeString(typename, &typid, &typmod, false);
 
 				typetup = SearchSysCache(TYPEOID,
 										 ObjectIdGetDatum(typid),
 										 0, 0, 0);
 				if (!HeapTupleIsValid(typetup))
-					elog(ERROR, "Cache lookup failed for type (%d) %s.",
+					elog(ERROR, "cache lookup failed for type (%d) %s",
 						 typid, typename);
 				typestruct = (Form_pg_type) GETSTRUCT(typetup);
 				typinput = typestruct->typinput;
@@ -2157,7 +2156,7 @@ tuple_t_from_alist(SCM alist, char mode, bool inner, arg_t *args, int nargs)
 				if (!found)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("Cannot find an argument with name %s!",
+							 errmsg("cannot find an argument with name \"%s\"",
 								 	tuple->names[i])));
 
 				typid = args[j].type;
@@ -2259,7 +2258,7 @@ datum_from_func_res(SCM res, bool *resisnull, int *nargs, arg_t *args,
 								 ObjectIdGetDatum(proc->restype),
 								 0, 0, 0);
 		if (!HeapTupleIsValid(typetup))
-			elog(ERROR, "Cache lookup failed for type %d.", proc->restype);
+			elog(ERROR, "cache lookup failed for type %d", proc->restype);
 		typestruct = (Form_pg_type) GETSTRUCT(typetup);
 		typinput = typestruct->typinput;
 		typmod = typestruct->typtypmod;
@@ -2402,7 +2401,7 @@ handle_func_res(void *data)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("SRF called in context that cannot accept a set.")));
+					 errmsg("SRF called in context that cannot accept a set")));
 		}
 		rsi->returnMode = SFRM_Materialize;
 
@@ -2422,8 +2421,7 @@ handle_func_res(void *data)
 		if (!scm_is_list(res))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("You must return a list of tuples "
-						 	"while returning from an SRF.")));
+					 errmsg("you must return a list of tuples while returning from an SRF")));
 
 		for (cdr = res; !scm_is_null(cdr); cdr = scm_cdr(cdr))
 		{
@@ -2442,10 +2440,7 @@ handle_func_res(void *data)
 				if (nargs < 1)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("You must specify at least one INOUT/OUT "
-								 	"arguments in a SRF. This information "
-									"will be used for checking returned "
-									"tuples' attribute integrity.")));
+							 errmsg("you must specify at least one INOUT/OUT arguments in a SRF")));
 			}
 		
 			/* Build tuple_t from returned SCM. */
@@ -2453,7 +2448,7 @@ handle_func_res(void *data)
 			if (tuple->isnull)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("You cannot return NULL tuple in an SRF.")));
+						 errmsg("you cannot return NULL tuple in an SRF")));
 
 			/* Check whether all tuple attributes are satisfied or not. */
 			check_tuple_consistency(tuple, args, nargs);
@@ -2518,10 +2513,10 @@ handle_trig_res(void *data)
 	 */
 	else
 	{
-		TupleDesc	 tupdesc;
+		TupleDesc	 tupdesc = NULL;
 		tuple_t		*tuple;
-		arg_t		*args;
-		int			 nargs;
+		arg_t		*args = NULL;
+		int			 nargs = 0;
 
 		/*
 		 * TODO: It's possible to skip below steps if user returned exactly the
@@ -2543,6 +2538,7 @@ handle_trig_res(void *data)
 			args = proc->tg_oldtup;
 			nargs = proc->tg_oldtup_natts;
 		}
+		/* TODO: or else?  uninitialized variables not set! */
 
 		/* Build tuple_t from returned SCM. */
 		tuple = tuple_t_from_alist(res, PROARGMODE_IN, false, args, nargs);
@@ -2617,7 +2613,7 @@ soft_port_create(void)
 	scm_vector_set_x(pv, scm_from_int(0), handler_c);
 	scm_vector_set_x(pv, scm_from_int(1), handler_s);
 	
-	return scm_make_soft_port(pv, scm_mem2string("w", 1));
+	return scm_make_soft_port(pv, scm_from_utf8_string("w"));
 }
 
 
@@ -2641,10 +2637,7 @@ guile_init(void)
 		guile_backtrace_stack = SCM_BOOL_F;
 
 		/* Enable backtracing. */
-		SCM_DEVAL_P = 1;
-		SCM_BACKTRACE_P = 1;
-		SCM_RECORD_POSITIONS_P = 1;
-		SCM_RESET_DEBUG_MODE;
+		scm_c_eval_string("(debug-enable 'backtrace)");
 
 		guile_init_level = 1;
 	}
@@ -2704,7 +2697,9 @@ guile_init_execution_module(void *data)
  * If this won't be a trusted PL, then create a child module using current
  * module interface.
  */
-#define CREATE_MODULE	"(make-module 0 (list (current-module)))"
+#define CREATE_MODULE \
+	"(use-modules (ice-9 r5rs))"\
+	"(make-module 0 (list (current-module)))"
 #endif
 
 	guile_execution_module = scm_eval_string(scm_from_locale_string(CREATE_MODULE));
@@ -2777,7 +2772,7 @@ guile_init_fly(void)
 		i++; \
 	} while (0)
 		
-#include "exceptions.c"
+#include "exceptions.h"
 	}
 
 	/*
@@ -2928,7 +2923,7 @@ guile_exception_handler(void *data, SCM tag, SCM args)
 	s[l - 1] = '\0';
 	ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
-			 errmsg("Uncaugth exception thrown from PL/scheme procedure."),
+			 errmsg("uncaught exception thrown from PL/scheme procedure"),
 			 errdetail("Guile error output:\n%s", s)));
 	
 	return SCM_UNSPECIFIED; /* Never reached. */
@@ -2982,12 +2977,12 @@ report(SCM in_level, SCM in_msg, SCM in_hint)
 
 		ereport(level,
 				(((level >= ERROR) ? errcode(ERRCODE_RAISE_EXCEPTION) : 0),
-				 errmsg(msg), errhint(hint)));
+				 errmsg("%s", msg), errhint("%s", hint)));
 	}
 	else
 		ereport(level,
 				(((level >= ERROR) ? errcode(ERRCODE_RAISE_EXCEPTION) : 0),
-				 errmsg(msg)));
+				 errmsg("%s", msg)));
 
 	return in_level;
 }
@@ -3125,7 +3120,7 @@ convert_from_spi(int ret)
 		RETURN_SPI_SYM(SPI_ERROR_UNCONNECTED,	SPI_SYM_ERROR_UNCONNECTED);
 
 		default:
-			elog(ERROR, "Couldn't recognize SPI return value! (%d)", ret);
+			elog(ERROR, "couldn't recognize SPI return value (%d)", ret);
 	}
 	
 	return SCM_UNSPECIFIED; /* Will never reach here. */
@@ -3139,8 +3134,8 @@ convert_from_spi(int ret)
 static SCM
 spi_return_tuples(int ret, SCM throw_args)
 {
-	bool	has_affected_tuples;
-	bool	has_returned_tuples;
+	bool	has_affected_tuples = false;
+	bool	has_returned_tuples = false;
 	SCM		res;
 	
 	switch (ret)
@@ -3201,7 +3196,7 @@ spi_return_tuples(int ret, SCM throw_args)
 
 		/* Number of attributes a single tuple will hold. */
 		for (natts = i = 0; i < tupdesc->natts; i++)
-			if (!tupdesc->attrs[i]->attisdropped)
+			if (!TupleDescAttr(tupdesc, i)->attisdropped)
 				natts++;
 
 		for (i = 0; i < ntuples; i++)
@@ -3214,13 +3209,13 @@ spi_return_tuples(int ret, SCM throw_args)
 			{
 				bool			 isnull;
 				Datum			 attr;
-				Oid				 atttypid = tupdesc->attrs[j]->atttypid;
+				Oid				 atttypid = TupleDescAttr(tupdesc, j)->atttypid;
 				HeapTuple		 typetup;
 				Form_pg_type	 typestruct;
 				char			*outputstr;
 				SCM				 val;
 				
-				if (tupdesc->attrs[j]->attisdropped)
+				if (TupleDescAttr(tupdesc, j)->attisdropped)
 					continue;
 
 				attr = heap_getattr(tuple, (j + 1), tupdesc, &isnull);
@@ -3234,7 +3229,7 @@ spi_return_tuples(int ret, SCM throw_args)
 										 ObjectIdGetDatum(atttypid),
 										 0, 0, 0);
 				if (!HeapTupleIsValid(typetup))
-					elog(ERROR, "Cache lookup failed for type %d.", atttypid);
+					elog(ERROR, "cache lookup failed for type %d", atttypid);
 				typestruct = (Form_pg_type) GETSTRUCT(typetup);
 
 				/* Get string representation of the attribute. */
@@ -3327,7 +3322,7 @@ spi_prepare(SCM in_command, SCM in_argtypes)
 			SCM_VALIDATE_STRING(1, scm);
 			SCM_SAFE_STRDUP(scm, typname);
 
-			parseTypeString(typname, &argtypes[i], &typmod);
+			parseTypeString(typname, &argtypes[i], &typmod, false);
 		}
 	}
 	else

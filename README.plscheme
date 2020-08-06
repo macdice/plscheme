@@ -16,63 +16,28 @@ favorite programming language!
 For more information you can visit project web site at
 https://vlkan.com/plscheme/
 
-
 __________                             ________________________________________
 _/_/_/_/_/ COMPILATION & INSTALLATION /_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
 
-You'll need Guile (version >= 1.8.0) to be able to compile and run PL/scheme.
+You'll need Guile (version >= 2.2.0) to be able to compile and run PL/scheme.
 But luckily, most of the Linux/BSD distributions provide Guile by default, or at
 least there should be a binary package of it appropriate to your distribution.
 
-The most easy (and suggested) way to compile compile and install PL/scheme is to
-use install.sh script that comes with the package. (See `./install.sh --help'
-for details.) It's also possible to follow below steps that goes into depths of
-the compilation and installation process.
+Make sure that pg_config is in your $PATH, and then simply make (or gmake),
+then make (or gmake) install.  You may need to tell it where to find Guile with
+something like "gmake LDFLAGS=-L/usr/local/lib", depending on where Guile is
+installed.
 
-First of all, you'll need to compile plscheme.c file to have plscheme.so unless
-you downloaded a binary version of PL/scheme.
-
-#
-# While compiling from sources, pay attention to Guile library directories and
-# PostgreSQL directories exposed by pg_config. Also, you need to define
-# MODULE_DIR to make PL/scheme locate place its Scheme files.
-#
-PG_INCLUDEDIR=`pg_config --includedir-server`
-PG_PKGLIBDIR=`pg_config --pkglibdir`
-
-cc -g -Wall -fpic -c \
-  -DMODULE_DIR=\"$PG_PKGLIBDIR\" \
-  -DMAX_CACHE_SIZE=64 \
-  -I$PG_INCLUDEDIR \
-  -o plschemeu.o plscheme.c
-# You can also use a -DSAFE_R5RS flag to get a trusted PL.
-
-cc -lguile -shared -o plschemeu.so plscheme.o
-
-cp plschemeu.so $PG_PKGLIBDIR
-cp init.scm $PG_PKGLIBDIR
-cp dataconv.scm $PG_PKGLIBDIR
-
-After you've got a .so file by manually compiled from source or downloading a
-binary file, you can easily install PL/scheme into a specific database via below
-SQL command:
-
-CREATE FUNCTION plschemeu_call_handler()
-  RETURNS language_handler
-  AS '$libdir/plschemeu' LANGUAGE C;
-
-CREATE LANGUAGE plschemeu
-  HANDLER plschemeu_call_handler;
-
-If everything went ok and you still get these kind of error message while trying
-to load plschemeu.so:
-
-FATAL:  could not load library "/../plschemeu.so": /.../libguile.so.17: undefined
-symbol: pthread_create
-
-Just use -lpthread flag while linking plschemeu.so. (Or prepend -lpthread into
-your LDFLAGS environment varible just before calling ./install.sh script.)
-
+postgres=# create extension plschemeu;
+CREATE EXTENSION
+postgres=# create or replace function my_func(a int, b int)
+           returns int language plschemeu as $$ (+ a b) $$;
+CREATE FUNCTION
+postgres=# select my_func(1, 2);
+ my_func
+---------
+       3
+(1 row)
 
 __________          __________________________________________________________
 _/_/_/_/_/ LICENSE /_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/_/
@@ -81,6 +46,9 @@ PL/scheme, Procedural Language Handler
 
 Copyright (c) 2006-2019, Volkan Yazıcı <vlkan.yazici@gmail.com>
 All rights reserved.
+
+Resurrected by Thomas Munro in 2018, upgraded from PostgreSQL 8.0 + Guile 1.8
+to PostgreSQL 11 + Guile 2.2.
 
 Redistribution and use in source and binary forms, with or without modification,
 are permitted provided that the following conditions are met:
